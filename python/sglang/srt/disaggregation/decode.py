@@ -524,7 +524,7 @@ class DecodePreallocQueue:
                 ]
             elif isinstance(self.token_to_kv_pool, SWAKVPool):
                 # SWA hybrid model: send decode-side SWA window indices
-                seq_len = len(decode_req.req.origin_input_ids)
+                seq_len = len(decode_req.req.fill_ids)
                 window_size = self.scheduler.sliding_window_size
 
                 window_start = max(0, seq_len - window_size)
@@ -542,7 +542,7 @@ class DecodePreallocQueue:
                 state_indices = window_kv_indices_swa.cpu().numpy()
                 state_indices = kv_to_page_indices(state_indices, page_size)
             elif isinstance(self.token_to_kv_pool, NSATokenToKVPool):
-                seq_len = len(decode_req.req.origin_input_ids)
+                seq_len = len(decode_req.req.fill_ids)
                 kv_indices_full = self.req_to_token_pool.req_to_token[
                     decode_req.req.req_pool_idx, :seq_len
                 ]
