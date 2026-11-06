@@ -12,7 +12,7 @@ import logging
 import uuid
 from typing import TYPE_CHECKING, Any, AsyncGenerator, Optional, Union
 
-from fastapi import Request
+from fastapi import HTTPException, Request
 from fastapi.responses import JSONResponse, StreamingResponse
 from pydantic import BaseModel, ValidationError
 
@@ -47,12 +47,12 @@ from sglang.srt.entrypoints.openai.protocol import (
     ChatCompletionRequest,
     ChatCompletionResponse,
     ChatCompletionStreamResponse,
+    ResponseFormat,
     StreamOptions,
     Tool,
     ToolChoice,
     ToolChoiceFuncName,
 )
-from sglang.srt.managers.template_detection import detect_inline_system_support
 from sglang.srt.observability.req_time_stats import monotonic_time
 
 if TYPE_CHECKING:
@@ -190,18 +190,7 @@ class AnthropicServing:
 
     def __init__(self, openai_serving_chat: OpenAIServingChat):
         self.openai_serving_chat = openai_serving_chat
-        self._merge_inline_system = not detect_inline_system_support(
-            self._chat_template()
-        )
-
-    def _chat_template(self) -> Optional[str]:
-        tokenizer_manager = getattr(self.openai_serving_chat, "tokenizer_manager", None)
-        if tokenizer_manager is None:
-            return None
-        tokenizer = getattr(tokenizer_manager, "tokenizer", None)
-        if tokenizer is None:
-            return None
-        return getattr(tokenizer, "chat_template", None)
+        self._merge_inline_system = not openai_serving_chat.supports_inline_system
 
     async def handle_messages(
         self,
@@ -297,7 +286,7 @@ class AnthropicServing:
 
         def _convert_tool_result_content(
             content: Any,
-        ) -> tuple[Union[str, list[dict]], str]:
+        ) -> tuple[list[Union[str, list[dict]]], str]:
             if isinstance(content, list):
                 tool_content_parts = []
                 tool_text_parts = []
@@ -342,22 +331,38 @@ class AnthropicServing:
                             )
 
                 tool_text = "\n".join(tool_text_parts)
-                if (
-                    len(tool_content_parts) == 1
-                    and tool_content_parts[0]["type"] == "text"
-                ):
-                    return tool_content_parts[0]["text"], tool_text
-                if tool_content_parts:
-                    return tool_content_parts, tool_text
-                return "", tool_text
+                # GLM templates expand references only at the start of a tool
+                # message, so isolate reference runs without changing part order.
+                tool_content_groups: list[list[dict]] = []
+                for part in tool_content_parts:
+                    is_reference = part["type"] == "tool_reference"
+                    if (
+                        not tool_content_groups
+                        or (tool_content_groups[-1][0]["type"] == "tool_reference")
+                        != is_reference
+                    ):
+                        tool_content_groups.append([])
+                    tool_content_groups[-1].append(part)
+
+                tool_contents: list[Union[str, list[dict]]] = []
+                for group in tool_content_groups:
+                    if len(group) == 1 and group[0]["type"] == "text":
+                        tool_contents.append(group[0]["text"])
+                    else:
+                        tool_contents.append(group)
+                return tool_contents or [""], tool_text
 
             tool_text = str(content) if content else ""
-            return tool_text, tool_text
+            return [tool_text], tool_text
 
         def _convert_assistant_thinking_blocks(
             blocks: list[AnthropicContentBlock],
-        ) -> Optional[str]:
-            """Re-wrap prior-turn thinking blocks in the parser's own tokens.
+        ) -> tuple[Optional[str], Optional[str]]:
+            """Reconstruct prior-turn thinking as ``(reasoning_content, text)``.
+
+            At most one is set: encoders that frame the reasoning channel take
+            it as ``reasoning_content``, everything else gets it re-wrapped and
+            spliced into content.
 
             ``redacted_thinking`` carries encrypted bytes that no local
             parser can interpret, so we raise rather than silently drop it.
@@ -375,11 +380,15 @@ class AnthropicServing:
                 if block.type == "thinking" and block.thinking
             ]
             if not thinking_parts:
-                return None
+                return None, None
+
+            reasoning_text = "\n".join(thinking_parts)
+            if self.openai_serving_chat.supports_native_reasoning_history():
+                return reasoning_text, None
 
             try:
-                return self.openai_serving_chat.wrap_reasoning_history(
-                    "\n".join(thinking_parts)
+                return None, self.openai_serving_chat.wrap_reasoning_history(
+                    reasoning_text
                 )
             except ValueError as e:
                 logger.warning(
@@ -387,7 +396,7 @@ class AnthropicServing:
                     len(thinking_parts),
                     e,
                 )
-                return None
+                return None, None
 
         system_parts: list[str] = []
         if anthropic_request.system:
@@ -442,7 +451,11 @@ class AnthropicServing:
             tool_calls: list[dict] = []
 
             if msg.role == "assistant":
-                reasoning_history = _convert_assistant_thinking_blocks(msg.content)
+                reasoning_content, reasoning_history = (
+                    _convert_assistant_thinking_blocks(msg.content)
+                )
+                if reasoning_content is not None:
+                    openai_msg["reasoning_content"] = reasoning_content
                 if reasoning_history is not None:
                     content_parts.append({"type": "text", "text": reasoning_history})
 
@@ -484,7 +497,7 @@ class AnthropicServing:
                     tool_calls.append(tool_call)
 
                 elif block.type == "tool_result":
-                    tool_content, tool_text = _convert_tool_result_content(
+                    tool_contents, tool_text = _convert_tool_result_content(
                         block.content
                     )
 
@@ -497,13 +510,14 @@ class AnthropicServing:
                     # block must come AFTER that text in OpenAI form too).
                     if msg.role == "user":
                         _emit_user_message(content_parts)
-                        openai_messages.append(
-                            {
-                                "role": "tool",
-                                "tool_call_id": tool_call_id,
-                                "content": tool_content,
-                            }
-                        )
+                        for tool_content in tool_contents:
+                            openai_messages.append(
+                                {
+                                    "role": "tool",
+                                    "tool_call_id": tool_call_id,
+                                    "content": tool_content,
+                                }
+                            )
                     else:
                         content_parts.append(
                             {
@@ -542,6 +556,8 @@ class AnthropicServing:
             "model": anthropic_request.model,
             "max_tokens": anthropic_request.max_tokens,
             "stream": anthropic_request.stream or False,
+            "cache_salt": anthropic_request.cache_salt,
+            **anthropic_request.pd_routing_kwargs(),
         }
 
         if anthropic_request.temperature is not None:
@@ -563,15 +579,6 @@ class AnthropicServing:
         chat_request = ChatCompletionRequest(**request_data)
 
         if anthropic_request.thinking is not None:
-            # The protocol layer already enforces SDK shape:
-            #   enabled  -> budget_tokens required (>=1024), display optional
-            #   disabled -> neither budget_tokens nor display allowed
-            #   adaptive -> budget_tokens forbidden, display optional
-            # So by the time we get here ``budget_tokens`` can only be
-            # set on ``enabled``. The local backend has no equivalent
-            # hard-cap knob, so we log a WARNING instead of rejecting —
-            # the Anthropic SDK would have accepted the request and we
-            # mirror that. Operators see the unenforced budget in logs.
             if anthropic_request.thinking.budget_tokens is not None:
                 logger.warning(
                     "Anthropic thinking.budget_tokens=%d is accepted for "
@@ -579,19 +586,15 @@ class AnthropicServing:
                     "equivalent hard-cap knob — the budget is not enforced",
                     anthropic_request.thinking.budget_tokens,
                 )
-            # Claude 4.7's ``adaptive`` is treated identically to ``enabled``
-            # because the local backend has no auto-throttle equivalent.
-            # Anything other than ``disabled`` enables reasoning.
+            # The backend has no adaptive throttle, so ``adaptive`` runs as ``enabled``.
             enabled = anthropic_request.thinking.type != "disabled"
-            if anthropic_request.thinking.display == "omitted":
-                # Anthropic 4.7 spec: keep reasoning ON but hide reasoning
-                # text from the client. The OpenAI streaming pipeline has
-                # no equivalent suppress knob — log so operators can see
-                # the request, then proceed with normal reasoning emission.
+            display = anthropic_request.thinking.display
+            if display in ("omitted", "updates"):
                 logger.warning(
-                    "Anthropic thinking.display='omitted' is accepted for "
+                    "Anthropic thinking.display=%r is accepted for "
                     "SDK compatibility but reasoning text will still be "
-                    "emitted to the client"
+                    "emitted to the client",
+                    display,
                 )
             self.openai_serving_chat.apply_reasoning_enabled(chat_request, enabled)
 
@@ -603,6 +606,15 @@ class AnthropicServing:
         # is still the hard cap).
         if anthropic_request.output_config is not None:
             oc = anthropic_request.output_config
+            if oc.format is not None:
+                chat_request.response_format = ResponseFormat(
+                    type="json_schema",
+                    json_schema={
+                        "name": "response",
+                        "schema": oc.format.schema_,
+                        "strict": True,
+                    },
+                )
             if oc.effort is not None:
                 chat_request.reasoning_effort = (
                     "max" if oc.effort == "xhigh" else oc.effort
@@ -656,6 +668,7 @@ class AnthropicServing:
                             "name": tool.name,
                             "description": tool.description or "",
                             "parameters": tool.input_schema,
+                            "strict": tool.strict,
                         },
                     )
                 )
@@ -669,6 +682,9 @@ class AnthropicServing:
         # no tool the model could call. Silently downgrading to "no tool"
         # would deceive the caller, so raise an explicit 400.
         if anthropic_request.tool_choice is not None:
+            chat_request.parallel_tool_calls = (
+                not anthropic_request.tool_choice.disable_parallel_tool_use
+            )
             tc_type = anthropic_request.tool_choice.type
             if tc_type == "none":
                 chat_request.tool_choice = "none"
@@ -743,6 +759,21 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
+        except HTTPException as e:
+            logger.warning(
+                "Non-streaming request rejected: %s %s", e.status_code, e.detail
+            )
+            return self._error_response(
+                status_code=e.status_code,
+                error_type=ERROR_TYPE_MAP.get(e.status_code, "api_error"),
+                message=_scrub_error_message(str(e.detail), e.status_code),
+            )
         except Exception as e:
             logger.exception("Error processing Anthropic request: %s", e)
             return self._error_response(
@@ -788,6 +819,12 @@ class AnthropicServing:
             adapted_request.received_time = received_time
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error converting streaming request: %s", e)
             return self._error_response(
@@ -1044,8 +1081,7 @@ class AnthropicServing:
                 effective_finish = finish_reason or "stop"
                 if effective_finish not in STOP_REASON_MAP:
                     logger.warning(
-                        "Unmapped streaming finish_reason %r; defaulting "
-                        "to end_turn",
+                        "Unmapped streaming finish_reason %r; defaulting to end_turn",
                         effective_finish,
                     )
                 stop_reason = STOP_REASON_MAP.get(effective_finish, "end_turn")
@@ -1408,6 +1444,7 @@ class AnthropicServing:
                 thinking=request.thinking,
                 tools=request.tools,
                 tool_choice=request.tool_choice,
+                output_config=request.output_config,
             )
             chat_request = self._convert_to_chat_completion_request(messages_request)
         except asyncio.CancelledError:
@@ -1442,6 +1479,12 @@ class AnthropicServing:
             )
         except asyncio.CancelledError:
             raise
+        except ValueError as e:
+            return self._error_response(
+                status_code=400,
+                error_type="invalid_request_error",
+                message=str(e),
+            )
         except Exception as e:
             logger.exception("Error counting tokens: %s", e)
             return self._error_response(

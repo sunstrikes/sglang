@@ -28,6 +28,7 @@ from sglang.srt.configs.mamba_utils import (
     Mamba2StateShape,
     mamba2_state_dtype,
 )
+from sglang.srt.runtime_context import get_parallel
 
 logger = logging.get_logger(__name__)
 
@@ -38,6 +39,11 @@ MOE = "E"
 DEFAULT_LAYERS_BLOCK_TYPE = ["mamba", "moe", "attention", "moe"]
 DEFAULT_MTP_LAYERS_BLOCK_TYPE = ["attention", "moe"]
 DEFAULT_MAMBA_CHUNK_SIZE = 256
+# transformers >= 5.13 writes these names into config.json.
+TRANSFORMERS_V5_LAYER_TYPE_ALIASES = {
+    "linear_attention": "mamba",
+    "full_attention": "attention",
+}
 
 
 class NemotronHConfig(PretrainedConfig):
@@ -70,7 +76,9 @@ class NemotronHConfig(PretrainedConfig):
             or MoE (`E`).
         layers_block_type (`list[str]`, *optional*):
             Canonical layer layout. Each entry is one of:
-            `"mamba"`, `"attention"`, `"mlp"`, `"moe"`.
+            `"mamba"`, `"attention"`, `"mlp"`, `"moe"`. The transformers >= 5.13
+            names `"linear_attention"` and `"full_attention"` are accepted as
+            aliases of `"mamba"` and `"attention"`.
         num_attention_heads (`int`, *optional*, defaults to 32):
             Number of attention heads for each attention layer in the
             Transformer encoder.
@@ -191,6 +199,15 @@ class NemotronHConfig(PretrainedConfig):
             )
 
     @staticmethod
+    def _normalize_layer_type_names(layers_block_type):
+        if layers_block_type is None:
+            return None
+        return [
+            TRANSFORMERS_V5_LAYER_TYPE_ALIASES.get(block_type, block_type)
+            for block_type in layers_block_type
+        ]
+
+    @staticmethod
     def _resolve_layers_block_type(
         layers_block_type, hybrid_override_pattern, kwargs
     ) -> list[str]:
@@ -301,6 +318,9 @@ class NemotronHConfig(PretrainedConfig):
         **kwargs,
     ):
         mamba_chunk_size = self._resolve_mamba_chunk_size(mamba_chunk_size, kwargs)
+
+        layers_block_type = self._normalize_layer_type_names(layers_block_type)
+        mtp_layers_block_type = self._normalize_layer_type_names(mtp_layers_block_type)
 
         # Compatibility parsing: normalize legacy pattern fields into canonical list fields.
         layers_block_type = self._resolve_layers_block_type(
@@ -422,10 +442,9 @@ class NemotronHConfig(PretrainedConfig):
 
     @property
     def mamba2_cache_params(self) -> Mamba2CacheParams:
-        from sglang.srt.layers.dp_attention import get_attention_tp_size
 
         shape = Mamba2StateShape.create(
-            tp_world_size=get_attention_tp_size(),
+            tp_world_size=get_parallel().attn_tp_size,
             intermediate_size=self.mamba_num_heads * self.mamba_head_dim,
             n_groups=self.n_groups,
             num_heads=self.mamba_num_heads,

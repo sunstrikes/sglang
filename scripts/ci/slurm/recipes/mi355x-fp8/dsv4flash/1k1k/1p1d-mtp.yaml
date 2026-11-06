@@ -21,7 +21,6 @@ backend:
       data-parallel-size: 1
 
 runtime:
-  image: lmsysorg/sglang-rocm:v0.5.13.post1-rocm720-mi35x-20260623
   attention_backend: dsv4
   # RoCE HCAs MORI uses for cross-node KV transfer.
   ib_devices: rdma0,rdma1,rdma2,rdma3
@@ -33,6 +32,7 @@ runtime:
   mem_fraction_static: 0.90
   page_size: 256
   max_running_requests: 256
+  max_total_tokens: 8551168
   chunked_prefill_size: 8192
   swa_full_tokens_ratio: 0.1
 

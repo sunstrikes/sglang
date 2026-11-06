@@ -2,7 +2,9 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from sglang.test.ci.ci_register import register_amd_ci, register_cuda_ci
 
-register_cuda_ci(est_time=10, stage="base-b", runner_config="1-gpu-small")
+register_cuda_ci(est_time=9, stage="base-b", runner_config="1-gpu-small")
+# The stochastic-rounding cases need SM10x; the 5090 above is SM120.
+register_cuda_ci(est_time=25, stage="base-b", runner_config="4-gpu-b200")
 register_amd_ci(est_time=20, suite="stage-b-test-1-gpu-small-amd")
 
 # Adapted from https://github.com/vllm-project/vllm/blob/633f943e30a4444d890d26b81850f7217736f840/tests/kernels/mamba/test_mamba_ssm_ssd.py
@@ -13,8 +15,8 @@ import torch
 import torch.nn.functional as F
 from einops import rearrange, repeat
 
-from sglang.srt.layers.attention.mamba.causal_conv1d_triton import PAD_SLOT_ID
-from sglang.srt.layers.attention.mamba.ops.mamba_ssm import selective_state_update
+from sglang.kernels.ops.mamba.causal_conv1d_triton import PAD_SLOT_ID
+from sglang.kernels.ops.mamba.triton_ops.mamba_ssm import selective_state_update
 from sglang.srt.utils import get_device, is_sm100_supported
 
 
